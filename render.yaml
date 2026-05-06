@@ -2,7 +2,9 @@ services:
   - type: web
     name: video-intel-backend
     runtime: python
-    plan: starter
+    # Free plan: sleeps after 15 min idle, ~30-60s cold start. $0/mo.
+    # Upgrade to "starter" ($7/mo) for always-on if cold starts annoy you.
+    plan: free
     region: oregon
     buildCommand: |
       apt-get update && apt-get install -y ffmpeg
