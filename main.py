@@ -5,17 +5,17 @@ Pipeline:
   1. POST /transcribe { id, url }
   2. yt-dlp tries native captions first (free, fast)
   3. Falls back to: OpenAI Whisper (primary) -> ElevenLabs Scribe (fallback)
-  4. Anthropic Claude Sonnet summarizes -> summary, key_points, CTA, skill_candidate
+  4. OpenAI GPT-4o-mini summarizes (primary) -> Anthropic Claude (fallback)
   5. Writes the full result back to vi_links via Supabase REST
   6. Returns 200 OK once started; result lands via DB update + frontend realtime sub
 
 Env vars (set on Fly via `fly secrets set ...`):
-  OPENAI_API_KEY            OpenAI Whisper transcription (primary)
-  ELEVENLABS_API_KEY        ElevenLabs Scribe transcription (fallback)
-  ANTHROPIC_API_KEY         Claude summarization
+  OPENAI_API_KEY            OpenAI Whisper STT + GPT-4o-mini summarization
+  ELEVENLABS_API_KEY        ElevenLabs Scribe STT (fallback)
+  ANTHROPIC_API_KEY         Claude summarization (fallback)
   SUPABASE_URL              https://vaerkevjrupxdbgrxfkk.supabase.co
   SUPABASE_SERVICE_KEY      service_role JWT (bypasses RLS for backend writes)
-  ALLOWED_ORIGIN            https://video-intel.ai-loren.com
+  ALLOWED_ORIGIN            https://video-intel.ai-loren.com (or *)
 """
 from __future__ import annotations
 
@@ -48,11 +48,11 @@ SUPABASE_KEY   = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPAB
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
 
 if not (OPENAI_KEY or ELEVENLABS_KEY):
-    print("WARN: Neither OPENAI_API_KEY nor ELEVENLABS_API_KEY set - transcription fallback will fail", file=sys.stderr)
-if not ANTHROPIC_KEY:
-    print("WARN: ANTHROPIC_API_KEY not set - summarization will fail", file=sys.stderr)
+    print("WARN: Neither OPENAI_API_KEY nor ELEVENLABS_API_KEY set", file=sys.stderr)
+if not (OPENAI_KEY or ANTHROPIC_KEY):
+    print("WARN: Neither OPENAI_API_KEY nor ANTHROPIC_API_KEY set - summarization will fail", file=sys.stderr)
 if not SUPABASE_URL or not SUPABASE_KEY:
-    print("WARN: SUPABASE_URL / SUPABASE_SERVICE_KEY not set - DB writes will fail", file=sys.stderr)
+    print("WARN: SUPABASE_URL / SUPABASE_SERVICE_KEY not set", file=sys.stderr)
 
 openai_client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 claude        = Anthropic(api_key=ANTHROPIC_KEY) if ANTHROPIC_KEY else None
@@ -60,11 +60,12 @@ claude        = Anthropic(api_key=ANTHROPIC_KEY) if ANTHROPIC_KEY else None
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
-app = FastAPI(title="video-intel-backend", version="2.1")
+app = FastAPI(title="video-intel-backend", version="2.2")
 
+# Permissive CORS - backend is gated by needing valid Supabase row UUID anyway.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[ALLOWED_ORIGIN] if ALLOWED_ORIGIN != "*" else ["*"],
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -103,7 +104,7 @@ def detect_platform(url: str) -> tuple[str, str]:
         m = re.search(r"/video/(\d+)", url)
         return ("tiktok", m.group(1) if m else url)
     if "instagram.com" in host:
-        m = re.search(r"/(?:reel|p|tv)/([A-Za-z0-9_-]+)", url)
+        m = re.search(r"/(?:reel|p|tv|reels)/([A-Za-z0-9_-]+)", url)
         return ("instagram", m.group(1) if m else url)
     if "youtube.com" in host or "youtu.be" in host:
         m = re.search(r"(?:v=|/shorts/|youtu\.be/)([A-Za-z0-9_-]{11})", url)
@@ -203,7 +204,6 @@ def elevenlabs_transcribe(audio: Path) -> str:
 
 
 def transcribe_audio(audio: Path) -> tuple[str, str]:
-    """Return (text, source). Tries Whisper first, falls back to ElevenLabs Scribe."""
     if openai_client:
         try:
             text = whisper_transcribe(audio)
@@ -224,7 +224,7 @@ def transcribe_audio(audio: Path) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Anthropic Claude summarization
+# Summarization
 # ---------------------------------------------------------------------------
 SUMMARIZE_PROMPT = """You are an analyst working for Master Makabi (Michael Makabi), COO of BRiX Technologies, founder of Loren AI, 1PM AI, MTIP CRE, and BroadBridge Fund.
 
@@ -245,22 +245,63 @@ Voice rules:
 Output: JSON ONLY. No markdown, no preamble. Begin with { and end with }."""
 
 
-def summarize(transcript: str, title: str, author: str, platform: str) -> dict:
-    if not claude:
-        return {"summary":"(summarization unavailable - ANTHROPIC_API_KEY not set)","key_points":[],"verification":[],"call_to_action":"","skill_candidate":False,"skill_description":""}
-    user = f"Platform: {platform}\nAuthor: {author}\nTitle: {title}\n\nTRANSCRIPT:\n{transcript}"
-    msg = claude.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=2048,
-        system=SUMMARIZE_PROMPT,
-        messages=[{"role":"user","content":user}],
-    )
-    text = msg.content[0].text if msg.content else "{}"
+def _parse_summary_json(text: str) -> dict:
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.MULTILINE)
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        return {"summary": text[:500],"key_points":[],"verification":[],"call_to_action":"","skill_candidate":False,"skill_description":""}
+        return {"summary": text[:500], "key_points":[], "verification":[], "call_to_action":"", "skill_candidate":False, "skill_description":""}
+
+
+def summarize_with_openai(user_msg: str) -> dict:
+    if not openai_client:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    r = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role":"system", "content": SUMMARIZE_PROMPT},
+            {"role":"user", "content": user_msg},
+        ],
+        response_format={"type":"json_object"},
+        temperature=0.4,
+    )
+    text = r.choices[0].message.content or "{}"
+    return _parse_summary_json(text)
+
+
+def summarize_with_claude(user_msg: str) -> dict:
+    if not claude:
+        raise RuntimeError("ANTHROPIC_API_KEY not set")
+    msg = claude.messages.create(
+        model="claude-3-5-sonnet-20241022",
+        max_tokens=2048,
+        system=SUMMARIZE_PROMPT,
+        messages=[{"role":"user", "content": user_msg}],
+    )
+    text = msg.content[0].text if msg.content else "{}"
+    return _parse_summary_json(text)
+
+
+def summarize(transcript: str, title: str, author: str, platform: str) -> tuple[dict, str]:
+    """Return (summary_dict, source_used). Tries OpenAI GPT-4o-mini, falls back to Claude."""
+    user = f"Platform: {platform}\nAuthor: {author}\nTitle: {title}\n\nTRANSCRIPT:\n{transcript}"
+
+    # Primary: OpenAI GPT-4o-mini (cheap, fast, JSON mode supported)
+    if openai_client:
+        try:
+            return summarize_with_openai(user), "openai_gpt4o_mini"
+        except Exception as e:
+            print(f"OpenAI summary failed, falling back to Claude: {e}", file=sys.stderr)
+
+    # Fallback: Anthropic Claude
+    if claude:
+        try:
+            return summarize_with_claude(user), "anthropic_claude"
+        except Exception as e:
+            print(f"Anthropic summary failed: {e}", file=sys.stderr)
+            return ({"summary": f"(summarization failed: {e})","key_points":[],"verification":[],"call_to_action":"","skill_candidate":False,"skill_description":""}, "failed")
+
+    return ({"summary":"(summarization unavailable - no LLM key set)","key_points":[],"verification":[],"call_to_action":"","skill_candidate":False,"skill_description":""}, "none")
 
 
 # ---------------------------------------------------------------------------
@@ -290,11 +331,9 @@ def run_pipeline(row_id: str, url: str) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workdir = Path(tmp)
 
-            # Stage 1: native captions
             transcript = try_native_captions(url, workdir)
             transcript_source = "native_captions" if transcript and len(transcript) > 50 else None
 
-            # Stage 2: Whisper -> ElevenLabs fallback chain
             if not transcript_source:
                 audio = download_audio(url, workdir)
                 if audio:
@@ -316,14 +355,13 @@ def run_pipeline(row_id: str, url: str) -> None:
                     })
                     return
 
-        # Stage 3: summarize with Claude
         try:
-            summary = summarize(transcript, title, author, platform)
+            summary, summary_source = summarize(transcript, title, author, platform)
         except Exception as e:
             traceback.print_exc()
             summary = {"summary":f"(summarization failed: {e})","key_points":[],"verification":[],"call_to_action":"","skill_candidate":False,"skill_description":""}
+            summary_source = "failed"
 
-        # Final write
         supabase_update(row_id, {
             "title": title,
             "author": author,
@@ -352,7 +390,7 @@ def run_pipeline(row_id: str, url: str) -> None:
 # ---------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"service":"video-intel-backend","version":"2.1","ok":True}
+    return {"service":"video-intel-backend","version":"2.2","ok":True}
 
 
 @app.get("/health")
@@ -363,6 +401,7 @@ def health():
         "elevenlabs": bool(ELEVENLABS_KEY),
         "anthropic": bool(ANTHROPIC_KEY),
         "supabase": bool(SUPABASE_URL and SUPABASE_KEY),
+        "summarizer": "gpt-4o-mini (primary), claude (fallback)",
         "ts": datetime.now(timezone.utc).isoformat(),
     }
 
