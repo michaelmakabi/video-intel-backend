@@ -4,13 +4,14 @@ video-intel-backend  -  Fly.io-hosted transcription + summary service.
 Pipeline:
   1. POST /transcribe { id, url }
   2. yt-dlp tries native captions first (free, fast)
-  3. Falls back to audio download + ElevenLabs Scribe STT if no captions
+  3. Falls back to: OpenAI Whisper (primary) -> ElevenLabs Scribe (fallback)
   4. Anthropic Claude Sonnet summarizes -> summary, key_points, CTA, skill_candidate
   5. Writes the full result back to vi_links via Supabase REST
   6. Returns 200 OK once started; result lands via DB update + frontend realtime sub
 
 Env vars (set on Fly via `fly secrets set ...`):
-  ELEVENLABS_API_KEY        ElevenLabs Scribe transcription
+  OPENAI_API_KEY            OpenAI Whisper transcription (primary)
+  ELEVENLABS_API_KEY        ElevenLabs Scribe transcription (fallback)
   ANTHROPIC_API_KEY         Claude summarization
   SUPABASE_URL              https://vaerkevjrupxdbgrxfkk.supabase.co
   SUPABASE_SERVICE_KEY      service_role JWT (bypasses RLS for backend writes)
@@ -33,30 +34,33 @@ import httpx
 from anthropic import Anthropic
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+OPENAI_KEY     = os.environ.get("OPENAI_API_KEY")
 ELEVENLABS_KEY = os.environ.get("ELEVENLABS_API_KEY")
 ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_API_KEY")
 SUPABASE_URL   = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY   = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_ANON_KEY")
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
 
-if not ELEVENLABS_KEY:
-    print("WARN: ELEVENLABS_API_KEY not set - transcription fallback will fail", file=sys.stderr)
+if not (OPENAI_KEY or ELEVENLABS_KEY):
+    print("WARN: Neither OPENAI_API_KEY nor ELEVENLABS_API_KEY set - transcription fallback will fail", file=sys.stderr)
 if not ANTHROPIC_KEY:
     print("WARN: ANTHROPIC_API_KEY not set - summarization will fail", file=sys.stderr)
 if not SUPABASE_URL or not SUPABASE_KEY:
     print("WARN: SUPABASE_URL / SUPABASE_SERVICE_KEY not set - DB writes will fail", file=sys.stderr)
 
-claude = Anthropic(api_key=ANTHROPIC_KEY) if ANTHROPIC_KEY else None
+openai_client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
+claude        = Anthropic(api_key=ANTHROPIC_KEY) if ANTHROPIC_KEY else None
 
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
-app = FastAPI(title="video-intel-backend", version="2.0")
+app = FastAPI(title="video-intel-backend", version="2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -173,10 +177,19 @@ def download_audio(url: str, workdir: Path) -> Path | None:
 
 
 # ---------------------------------------------------------------------------
-# ElevenLabs Scribe transcription
+# Transcription backends
 # ---------------------------------------------------------------------------
+def whisper_transcribe(audio: Path) -> str:
+    if not openai_client:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    with open(audio, "rb") as f:
+        result = openai_client.audio.transcriptions.create(
+            model="whisper-1", file=f, response_format="text",
+        )
+    return result if isinstance(result, str) else getattr(result, "text", "")
+
+
 def elevenlabs_transcribe(audio: Path) -> str:
-    """POST audio file to ElevenLabs Scribe STT, return transcript text."""
     if not ELEVENLABS_KEY:
         raise RuntimeError("ELEVENLABS_API_KEY not set")
     url = "https://api.elevenlabs.io/v1/speech-to-text"
@@ -186,9 +199,28 @@ def elevenlabs_transcribe(audio: Path) -> str:
         data = {"model_id": "scribe_v1"}
         r = httpx.post(url, headers=headers, files=files, data=data, timeout=180)
     r.raise_for_status()
-    body = r.json()
-    # API returns { "text": "...", "language_code": "...", "words": [...] }
-    return body.get("text", "")
+    return r.json().get("text", "")
+
+
+def transcribe_audio(audio: Path) -> tuple[str, str]:
+    """Return (text, source). Tries Whisper first, falls back to ElevenLabs Scribe."""
+    if openai_client:
+        try:
+            text = whisper_transcribe(audio)
+            if text:
+                return text, "openai_whisper"
+        except Exception as e:
+            print(f"Whisper failed, falling back: {e}", file=sys.stderr)
+
+    if ELEVENLABS_KEY:
+        try:
+            text = elevenlabs_transcribe(audio)
+            if text:
+                return text, "elevenlabs_scribe"
+        except Exception as e:
+            print(f"ElevenLabs failed: {e}", file=sys.stderr)
+
+    raise RuntimeError("All transcription backends failed")
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +256,6 @@ def summarize(transcript: str, title: str, author: str, platform: str) -> dict:
         messages=[{"role":"user","content":user}],
     )
     text = msg.content[0].text if msg.content else "{}"
-    # Strip any accidental markdown fences
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.MULTILINE)
     try:
         return json.loads(text)
@@ -263,22 +294,20 @@ def run_pipeline(row_id: str, url: str) -> None:
             transcript = try_native_captions(url, workdir)
             transcript_source = "native_captions" if transcript and len(transcript) > 50 else None
 
-            # Stage 2: ElevenLabs Scribe fallback
+            # Stage 2: Whisper -> ElevenLabs fallback chain
             if not transcript_source:
                 audio = download_audio(url, workdir)
                 if audio:
                     try:
-                        transcript = elevenlabs_transcribe(audio)
-                        transcript_source = "elevenlabs_scribe"
+                        transcript, transcript_source = transcribe_audio(audio)
                     except Exception as e:
                         traceback.print_exc()
-                        if not transcript:
-                            supabase_update(row_id, {
-                                "status":"failed",
-                                "error":f"ElevenLabs transcription failed: {e}",
-                                "title":title,"author":author,"duration_sec":duration,
-                            })
-                            return
+                        supabase_update(row_id, {
+                            "status":"failed",
+                            "error":f"All transcription backends failed: {e}",
+                            "title":title,"author":author,"duration_sec":duration,
+                        })
+                        return
                 else:
                     supabase_update(row_id, {
                         "status":"failed",
@@ -323,13 +352,14 @@ def run_pipeline(row_id: str, url: str) -> None:
 # ---------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"service":"video-intel-backend","version":"2.0","ok":True}
+    return {"service":"video-intel-backend","version":"2.1","ok":True}
 
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
+        "openai": bool(OPENAI_KEY),
         "elevenlabs": bool(ELEVENLABS_KEY),
         "anthropic": bool(ANTHROPIC_KEY),
         "supabase": bool(SUPABASE_URL and SUPABASE_KEY),
