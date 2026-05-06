@@ -11,18 +11,47 @@ FastAPI service powering [video-intel.ai-loren.com](https://video-intel.ai-loren
 5. Result PATCHed to Supabase `vi_links` row → status="done"
 6. Frontend listens via Supabase realtime; updates the moment the row lands
 
-## Deploy to Render
+## Deploy to Fly.io (recommended — already on free tier, ~1s cold start)
 
-1. New → Web Service → connect GitHub repo `michaelmakabi/video-intel-backend`
-2. Render auto-detects `render.yaml`. Plan: starter ($7/mo, no cold start).
-3. Set the two `sync: false` env vars in Render dashboard:
-   - `OPENAI_API_KEY` — your OpenAI key
-   - `SUPABASE_SERVICE_KEY` — Loren AI Supabase service role key (Supabase dashboard → Project Settings → API → service_role)
-4. Deploy. Once live, copy the `*.onrender.com` URL.
-5. In the frontend (`video-intel.ai-loren.com`) → Settings → Backend URL → paste the Render URL → Save.
+One-time setup (PowerShell, ~2 min):
 
-## Cost (per video)
+```powershell
+# Install flyctl
+iwr https://fly.io/install.ps1 -useb | iex
 
-- Native captions path: $0 (free, fast)
-- Whisper path: ~$0.006 per minute (Whisper) + ~$0.0002 (GPT-4o-mini summary) ≈ $0.006/min total
-- Render starter: $7/mo flat
+# Login (opens browser)
+fly auth login
+
+# Clone and cd
+git clone https://github.com/michaelmakabi/video-intel-backend
+cd video-intel-backend
+
+# Launch — uses fly.toml in the repo. Confirm app name when prompted.
+fly launch --no-deploy --copy-config
+
+# Set secrets (these stay encrypted, never in source)
+fly secrets set OPENAI_API_KEY="sk-..."
+fly secrets set SUPABASE_URL="https://vaerkevjrupxdbgrxfkk.supabase.co"
+fly secrets set SUPABASE_SERVICE_KEY="eyJ..."
+fly secrets set ALLOWED_ORIGIN="https://video-intel.ai-loren.com"
+
+# Deploy
+fly deploy
+```
+
+After deploy, your backend is live at `https://loren-video-intel.fly.dev` (or whatever app name you picked). Paste that URL into the frontend Settings panel.
+
+Get the SUPABASE_SERVICE_KEY from: https://supabase.com/dashboard/project/vaerkevjrupxdbgrxfkk/settings/api → `service_role` (NOT anon).
+
+## Deploy to Render (alternative)
+
+`render.yaml` is in the repo — connect repo on render.com → free plan auto-detected → set the same secrets in Render dashboard.
+
+## Cost
+
+- yt-dlp + native captions path: $0
+- Whisper API path: ~$0.006/min of audio (only fires for IG Reels + silent TikToks)
+- GPT-4o-mini summary: ~$0.0002 per video
+- Fly.io free tier: $0/mo within the free allowance (small footprint, auto-stops when idle)
+
+So unless you transcribe Instagram Reels constantly, this runs ~$0/mo all-in.
