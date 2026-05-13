@@ -7,15 +7,6 @@ Pipeline:
   3. Falls back to: OpenAI Whisper (primary) -> ElevenLabs Scribe (fallback)
   4. OpenAI GPT-4o-mini summarizes (primary) -> Anthropic Claude (fallback)
   5. Writes the full result back to vi_links via Supabase REST
-  6. Returns 200 OK once started; result lands via DB update + frontend realtime sub
-
-Env vars (set on Fly via `fly secrets set ...`):
-  OPENAI_API_KEY            OpenAI Whisper STT + GPT-4o-mini summarization
-  ELEVENLABS_API_KEY        ElevenLabs Scribe STT (fallback)
-  ANTHROPIC_API_KEY         Claude summarization (fallback)
-  SUPABASE_URL              https://vaerkevjrupxdbgrxfkk.supabase.co
-  SUPABASE_SERVICE_KEY      service_role JWT (bypasses RLS for backend writes)
-  ALLOWED_ORIGIN            https://video-intel.ai-loren.com (or *)
 """
 from __future__ import annotations
 
@@ -37,52 +28,28 @@ from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from pydantic import BaseModel
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 OPENAI_KEY     = os.environ.get("OPENAI_API_KEY")
 ELEVENLABS_KEY = os.environ.get("ELEVENLABS_API_KEY")
 ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_API_KEY")
 SUPABASE_URL   = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY   = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_ANON_KEY")
-ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
-
-if not (OPENAI_KEY or ELEVENLABS_KEY):
-    print("WARN: Neither OPENAI_API_KEY nor ELEVENLABS_API_KEY set", file=sys.stderr)
-if not (OPENAI_KEY or ANTHROPIC_KEY):
-    print("WARN: Neither OPENAI_API_KEY nor ANTHROPIC_API_KEY set - summarization will fail", file=sys.stderr)
-if not SUPABASE_URL or not SUPABASE_KEY:
-    print("WARN: SUPABASE_URL / SUPABASE_SERVICE_KEY not set", file=sys.stderr)
 
 openai_client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 claude        = Anthropic(api_key=ANTHROPIC_KEY) if ANTHROPIC_KEY else None
 
-# ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
-app = FastAPI(title="video-intel-backend", version="2.2")
+app = FastAPI(title="video-intel-backend", version="2.3")
 
-# Permissive CORS - backend is gated by needing valid Supabase row UUID anyway.
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=["*"], allow_credentials=False,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
 
-# ---------------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------------
 class TranscribeRequest(BaseModel):
     id: str
     url: str
 
 
-# ---------------------------------------------------------------------------
-# Supabase REST helpers
-# ---------------------------------------------------------------------------
 def supabase_update(row_id: str, patch: dict) -> None:
     url = f"{SUPABASE_URL}/rest/v1/vi_links?id=eq.{row_id}"
     headers = {
@@ -95,9 +62,6 @@ def supabase_update(row_id: str, patch: dict) -> None:
     r.raise_for_status()
 
 
-# ---------------------------------------------------------------------------
-# Platform detection + URL normalization
-# ---------------------------------------------------------------------------
 def detect_platform(url: str) -> tuple[str, str]:
     host = urlparse(url).netloc.lower().lstrip("www.")
     if "tiktok.com" in host:
@@ -121,9 +85,6 @@ def normalize_url(url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
 
 
-# ---------------------------------------------------------------------------
-# yt-dlp wrappers
-# ---------------------------------------------------------------------------
 def vtt_to_text(vtt: str) -> str:
     out, last = [], None
     for line in vtt.splitlines():
@@ -144,6 +105,23 @@ def get_metadata(url: str) -> dict:
         capture_output=True, text=True, timeout=60, check=True,
     )
     return json.loads(r.stdout)
+
+
+def pick_best_thumbnail(meta: dict, platform: str, video_id: str) -> str:
+    """Pick a good thumbnail URL from yt-dlp metadata, with platform-specific fallbacks."""
+    # yt-dlp returns 'thumbnail' (single best) and 'thumbnails' (list)
+    if meta.get("thumbnail"):
+        return meta["thumbnail"]
+    thumbs = meta.get("thumbnails") or []
+    if thumbs:
+        # Pick largest by width
+        best = max(thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0))
+        if best.get("url"):
+            return best["url"]
+    # Platform-specific fallbacks
+    if platform == "youtube" and video_id and len(video_id) == 11:
+        return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    return ""
 
 
 def try_native_captions(url: str, workdir: Path) -> str | None:
@@ -177,9 +155,6 @@ def download_audio(url: str, workdir: Path) -> Path | None:
     return cands[0] if cands else None
 
 
-# ---------------------------------------------------------------------------
-# Transcription backends
-# ---------------------------------------------------------------------------
 def whisper_transcribe(audio: Path) -> str:
     if not openai_client:
         raise RuntimeError("OPENAI_API_KEY not set")
@@ -210,8 +185,7 @@ def transcribe_audio(audio: Path) -> tuple[str, str]:
             if text:
                 return text, "openai_whisper"
         except Exception as e:
-            print(f"Whisper failed, falling back: {e}", file=sys.stderr)
-
+            print(f"Whisper failed: {e}", file=sys.stderr)
     if ELEVENLABS_KEY:
         try:
             text = elevenlabs_transcribe(audio)
@@ -219,30 +193,23 @@ def transcribe_audio(audio: Path) -> tuple[str, str]:
                 return text, "elevenlabs_scribe"
         except Exception as e:
             print(f"ElevenLabs failed: {e}", file=sys.stderr)
-
     raise RuntimeError("All transcription backends failed")
 
 
-# ---------------------------------------------------------------------------
-# Summarization
-# ---------------------------------------------------------------------------
 SUMMARIZE_PROMPT = """You are an analyst working for Master Makabi (Michael Makabi), COO of BRiX Technologies, founder of Loren AI, 1PM AI, MTIP CRE, and BroadBridge Fund.
 
 You receive a transcript from a short-form video Master Makabi captured. Produce a JSON object with these fields:
 
 - "summary": 3-6 sentences in operator voice. Direct, no fluff. State the LESSON the video taught, not "the speaker said...". This is what Master Makabi will read in 6 months when he wants to remember why he saved this clip.
 - "key_points": array of 3-7 strings. Concrete techniques, numbers, names, tools, scripts, frameworks. NO filler.
-- "verification": array of objects with shape {"claim": "...", "status": "verified"|"unverified"|"contradicted", "note": "..."}. Only include claims worth verifying (numbers, attributed quotes, technical assertions). Skip if it's pure opinion. Empty array is fine.
-- "call_to_action": ONE sentence. A concrete next step Master Makabi could take in the NEXT 24 HOURS that ties this video's lesson to BRiX, Loren AI, 1PM AI, MTIP, BroadBridge, or his team (Julio, Nicolas, Sanjeev, Shalu, Nataly, Loren). Not "consider doing X" - "do X." If you genuinely cannot tie it, say "No clear application - saved for reference."
-- "skill_candidate": boolean. TRUE only if the video describes a REPEATABLE WORKFLOW with clear inputs/outputs that's worth codifying as a skill in his Agent OS. False for pure motivation, opinion, news, one-off product reviews.
+- "verification": array of objects with shape {"claim": "...", "status": "verified"|"unverified"|"contradicted", "note": "..."}. Only include claims worth verifying. Empty array is fine.
+- "call_to_action": ONE sentence. A concrete next step Master Makabi could take in the NEXT 24 HOURS tied to BRiX, Loren AI, 1PM AI, MTIP, BroadBridge, or his team (Julio, Nicolas, Sanjeev, Shalu, Nataly, Loren). Not "consider doing X" - "do X." If you cannot tie it, say "No clear application - saved for reference."
+- "skill_candidate": boolean. TRUE only if the video describes a REPEATABLE WORKFLOW with clear inputs/outputs.
 - "skill_description": one sentence describing what the skill would do. Empty string if skill_candidate=false.
 
-Voice rules:
-- Operator. Direct. No corporate hedging.
-- Tie everything to his actual ventures by name.
-- Avoid generic advice. If you can't make it specific, say so.
+Voice: Operator. Direct. No corporate hedging. Tie everything to his actual ventures by name.
 
-Output: JSON ONLY. No markdown, no preamble. Begin with { and end with }."""
+Output: JSON ONLY. No markdown, no preamble."""
 
 
 def _parse_summary_json(text: str) -> dict:
@@ -254,8 +221,6 @@ def _parse_summary_json(text: str) -> dict:
 
 
 def summarize_with_openai(user_msg: str) -> dict:
-    if not openai_client:
-        raise RuntimeError("OPENAI_API_KEY not set")
     r = openai_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -270,8 +235,6 @@ def summarize_with_openai(user_msg: str) -> dict:
 
 
 def summarize_with_claude(user_msg: str) -> dict:
-    if not claude:
-        raise RuntimeError("ANTHROPIC_API_KEY not set")
     msg = claude.messages.create(
         model="claude-3-5-sonnet-20241022",
         max_tokens=2048,
@@ -283,35 +246,25 @@ def summarize_with_claude(user_msg: str) -> dict:
 
 
 def summarize(transcript: str, title: str, author: str, platform: str) -> tuple[dict, str]:
-    """Return (summary_dict, source_used). Tries OpenAI GPT-4o-mini, falls back to Claude."""
     user = f"Platform: {platform}\nAuthor: {author}\nTitle: {title}\n\nTRANSCRIPT:\n{transcript}"
-
-    # Primary: OpenAI GPT-4o-mini (cheap, fast, JSON mode supported)
     if openai_client:
         try:
             return summarize_with_openai(user), "openai_gpt4o_mini"
         except Exception as e:
-            print(f"OpenAI summary failed, falling back to Claude: {e}", file=sys.stderr)
-
-    # Fallback: Anthropic Claude
+            print(f"OpenAI summary failed: {e}", file=sys.stderr)
     if claude:
         try:
             return summarize_with_claude(user), "anthropic_claude"
         except Exception as e:
             print(f"Anthropic summary failed: {e}", file=sys.stderr)
             return ({"summary": f"(summarization failed: {e})","key_points":[],"verification":[],"call_to_action":"","skill_candidate":False,"skill_description":""}, "failed")
+    return ({"summary":"(no LLM key set)","key_points":[],"verification":[],"call_to_action":"","skill_candidate":False,"skill_description":""}, "none")
 
-    return ({"summary":"(summarization unavailable - no LLM key set)","key_points":[],"verification":[],"call_to_action":"","skill_candidate":False,"skill_description":""}, "none")
 
-
-# ---------------------------------------------------------------------------
-# Background pipeline
-# ---------------------------------------------------------------------------
 def run_pipeline(row_id: str, url: str) -> None:
     try:
         url = normalize_url(url)
         platform, vid = detect_platform(url)
-
         try:
             supabase_update(row_id, {"status":"processing","platform":platform,"video_id":vid})
         except Exception:
@@ -327,13 +280,21 @@ def run_pipeline(row_id: str, url: str) -> None:
         title = meta.get("title","")
         author = meta.get("uploader") or meta.get("channel") or ""
         duration = meta.get("duration", 0) or 0
+        thumbnail = pick_best_thumbnail(meta, platform, vid)
+
+        # Write metadata immediately so frontend can show thumbnail + title during processing
+        try:
+            supabase_update(row_id, {
+                "title": title, "author": author, "duration_sec": duration,
+                "thumbnail_url": thumbnail,
+            })
+        except Exception:
+            traceback.print_exc()
 
         with tempfile.TemporaryDirectory() as tmp:
             workdir = Path(tmp)
-
             transcript = try_native_captions(url, workdir)
             transcript_source = "native_captions" if transcript and len(transcript) > 50 else None
-
             if not transcript_source:
                 audio = download_audio(url, workdir)
                 if audio:
@@ -343,15 +304,13 @@ def run_pipeline(row_id: str, url: str) -> None:
                         traceback.print_exc()
                         supabase_update(row_id, {
                             "status":"failed",
-                            "error":f"All transcription backends failed: {e}",
-                            "title":title,"author":author,"duration_sec":duration,
+                            "error":f"Transcription failed: {e}",
                         })
                         return
                 else:
                     supabase_update(row_id, {
                         "status":"failed",
                         "error":"Could not extract audio (private/geoblocked/dead link?)",
-                        "title":title,"author":author,"duration_sec":duration,
                     })
                     return
 
@@ -363,19 +322,18 @@ def run_pipeline(row_id: str, url: str) -> None:
             summary_source = "failed"
 
         supabase_update(row_id, {
-            "title": title,
-            "author": author,
-            "duration_sec": duration,
+            "title": title, "author": author, "duration_sec": duration,
+            "thumbnail_url": thumbnail,
             "transcript": transcript,
             "transcript_source": transcript_source,
             "summary": summary.get("summary",""),
+            "summary_source": summary_source,
             "key_points": summary.get("key_points",[]),
             "verification": summary.get("verification",[]),
             "call_to_action": summary.get("call_to_action",""),
             "skill_candidate": summary.get("skill_candidate", False),
             "skill_description": summary.get("skill_description",""),
-            "status": "done",
-            "error": None,
+            "status": "done", "error": None,
         })
     except Exception as e:
         traceback.print_exc()
@@ -385,18 +343,16 @@ def run_pipeline(row_id: str, url: str) -> None:
             pass
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"service":"video-intel-backend","version":"2.2","ok":True}
+    return {"service":"video-intel-backend","version":"2.3","ok":True}
 
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
+        "version": "2.3",
         "openai": bool(OPENAI_KEY),
         "elevenlabs": bool(ELEVENLABS_KEY),
         "anthropic": bool(ANTHROPIC_KEY),
